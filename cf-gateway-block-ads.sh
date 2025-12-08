@@ -28,7 +28,6 @@ while [[ $# -gt 0 ]]; do
     --rule-name) RULE_NAME="$2"; shift 2 ;;
     --priority) PRIORITY="$2"; shift 2 ;;
     --adlists)
-      # Ghi đè ADLISTS bằng chuỗi phân cách dấu phẩy
       IFS=',' read -r -a ADLISTS <<< "$2"
       shift 2
       ;;
@@ -36,7 +35,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# --- 3. Kiểm tra biến môi trường và thiết lập API ---
+# --- 3. Kiểm tra biến môi trường ---
 if [[ -z "${CLOUDFLARE_ACCOUNT_ID:-}" || -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
   echo "❌ Must export CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN"
   exit 2
@@ -48,7 +47,7 @@ CURL_AUTH=(-H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" -H "Content-Type: 
 cleanup(){ rm -rf "$TEMPDIR"; }
 trap cleanup EXIT
 
-# --- 4. Tải và làm sạch tên miền (ĐÃ DÙNG LOGIC MỚI) ---
+# --- 4. Tải & làm sạch domain ---
 echo "1) Fetching and cleaning hostlists..."
 > "$RAW_TEMPFILE"
 
@@ -56,11 +55,10 @@ for ADLIST_URL in "${ADLISTS[@]}"; do
     echo " -> Fetching: $ADLIST_URL"
     if [[ "$ADLIST_URL" =~ ^file:// ]]; then
       FILE="${ADLIST_URL#file://}"
-      # Xử lý hosts/domain only
       awk '/^[^#]/ {
           if ($1 ~ /^[0-9]/) print $2;
           else if ($1 ~ /^[A-Za-z0-9.-]+$/) print $1;
-          else print $0; # Giữ nguyên để hàm extract_domains xử lý sau
+          else print $0;
       }' "$FILE" >> "$RAW_TEMPFILE"
     else
       curl -fsSL "$ADLIST_URL" | awk '/^[^#]/ {
@@ -72,30 +70,22 @@ for ADLIST_URL in "${ADLISTS[@]}"; do
 done
 
 RAW_COUNT=$(wc -l < "$RAW_TEMPFILE")
-echo " -> Raw entries from all lists: $RAW_COUNT"
-
-# --- CLEAN FIX MỚI SIÊU MẠNH ---
-echo " → Normalizing and cleaning domains…"
+echo " -> Raw entries: $RAW_COUNT"
 
 extract_domains() {
   sed -E '
-    # Xử lý Adblock/AdGuard: ||domain^... hoặc @@||domain^...
     s/^\|\|([a-zA-Z0-9.-]+)\^.*$/\1/;
     s/^@@\|\|([a-zA-Z0-9.-]+)\^.*$/\1/;
-    # Xử lý Dnsmasq/unbound (address=/domain/)
     s/^address=\/([a-zA-Z0-9.-]+)\/.*/\1/;
-    # Xử lý hosts file (loại bỏ IP)
     s/^0\.0\.0\.0[[:space:]]+//;
     s/^127\.0\.0\.1[[:space:]]+//;
     s/^::1[[:space:]]+//;
     s/^\[::\][[:space:]]+//;
     s/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+[[:space:]]+//;
-    # Loại bỏ ký tự wildcard ở đầu (thường là * + .)
     s/^[*+.]+//;
-  ' | grep -E '^[a-zA-Z0-9.-]+$' # Giữ lại các dòng chỉ chứa ký tự tên miền
+  ' | grep -E '^[a-zA-Z0-9.-]+$'
 }
 
-# Áp dụng các bước làm sạch bổ sung
 extract_domains < "$RAW_TEMPFILE" | \
   tr 'A-Z' 'a-z' | \
   grep -vE '\.\.|^\.|\.$|_' | \
@@ -105,127 +95,122 @@ extract_domains < "$RAW_TEMPFILE" | \
   sort -u > "$CLEANFILE"
 
 NUM=$(wc -l < "$CLEANFILE")
-echo " → Cleaned valid domains: $NUM"
+echo " → Cleaned: $NUM"
+
 [[ $NUM -eq 0 ]] && { echo "❌ No valid domains"; exit 4; }
 
-# --- 5. Chia nhỏ tên miền thành các tệp nhỏ (Chunks) ---
+# --- 5. Chia nhỏ ---
 NUM_CHUNKS=$(( (NUM + MAX_DOMAINS_PER_LIST - 1) / MAX_DOMAINS_PER_LIST ))
-echo "2) Splitting $NUM domains into $NUM_CHUNKS chunks (max $MAX_DOMAINS_PER_LIST/chunk)..."
+echo "2) Splitting into $NUM_CHUNKS chunks..."
 
 split -l "$MAX_DOMAINS_PER_LIST" "$CLEANFILE" "$TEMPDIR/chunk."
 
-# --- 6. Tạo/Cập nhật List Gateway và thêm tên miền ---
+# --- 6. Tạo/Cập nhật list ---
 ALL_LIST_IDS=""
+
 for ((i=1;i<=NUM_CHUNKS;i++)); do
     CHUNK_INDEX=$((i - 1))
-    CHUNK_FILE_SUFFIX=$(printf '%s' $CHUNK_INDEX | awk '{
-        n=$1; c1=int(n/26); c2=n%26;
-        printf("%c%c", 97+c1, 97+c2);
-    }')
-
+    CHUNK_FILE_SUFFIX=$(printf '%s' $CHUNK_INDEX | awk '{n=$1; c1=int(n/26); c2=n%26; printf("%c%c",97+c1,97+c2);}')
     CHUNK_FILE="$TEMPDIR/chunk.$CHUNK_FILE_SUFFIX"
-    # Kiểm tra tệp chunk có tồn tại không
-    if [[ ! -f "$CHUNK_FILE" ]]; then
-        # Nếu chunk.aa không tồn tại khi i=1, thì có lỗi. Nếu i > 1 thì có thể bỏ qua.
-        if [[ $i -eq 1 ]]; then 
-            if [[ ! -f "$TEMPDIR/chunk.aa" ]]; then continue; fi
-        else
-            continue 
-        fi
-    fi
+
+    [[ ! -f "$CHUNK_FILE" ]] && continue
 
     CHUNK_NUM=$(wc -l < "$CHUNK_FILE")
-    
-    # === PHẦN ĐÃ SỬA: FORMAT SỐ CÓ ĐỆM BẰNG 0 ===
-    LIST_NUM_FORMATTED=$(printf "%03d" $i)
-    CURRENT_LIST_NAME="$LIST_NAME $LIST_NUM_FORMATTED"
-    # ============================================
+    LIST_NUM=$(printf "%03d" $i)
+    CURRENT_LIST_NAME="$LIST_NAME $LIST_NUM"
 
     echo "---"
-    echo "3.$i) Processing List '$CURRENT_LIST_NAME' ($CHUNK_NUM domains)..."
+    echo "3.$i) Processing list: $CURRENT_LIST_NAME ($CHUNK_NUM items)"
 
-    UPLOAD_ITEMS_PAYLOAD=$(jq -R -s '
-        split("\n")[:-1]
-        | map(select(length>0))
-        | map({value: .})
-    ' < "$CHUNK_FILE")
-
-    # Find existing list
-    ENCODED_LIST_NAME=$(echo "$CURRENT_LIST_NAME" | sed 's/ /%20/g')
-    GET_LIST_RESP=$(curl -sS -X GET "${CURL_AUTH[@]}" "$API_BASE/gateway/lists?name=$ENCODED_LIST_NAME")
-
-    LIST_ID=""
-    # Lấy ID nếu tên trùng khớp
+    GET_LIST_RESP=$(curl -sS -X GET "${CURL_AUTH[@]}" "$API_BASE/gateway/lists?name=$(echo "$CURRENT_LIST_NAME" | sed 's/ /%20/g')")
     EXISTING_LIST_ID=$(echo "$GET_LIST_RESP" | jq -r '.result[]? | select(.name=="'"$CURRENT_LIST_NAME"'") | .id')
 
     if [[ -n "$EXISTING_LIST_ID" ]]; then
-      echo " → Found existing list ID: $EXISTING_LIST_ID. Replacing items..."
-      LIST_ID="$EXISTING_LIST_ID"
+        echo " → Found list ID: $EXISTING_LIST_ID"
+        LIST_ID="$EXISTING_LIST_ID"
 
-      # 1. Xóa items cũ (tránh lỗi API khi PATCH quá lớn)
-      GET_ITEMS_RESP=$(curl -sS -X GET "${CURL_AUTH[@]}" "$API_BASE/gateway/lists/$LIST_ID/items?per_page=1000")
-      EXISTING_VALUES=$(echo "$GET_ITEMS_RESP" | jq -r '.result[].value')
-      
-      if [[ -n "$EXISTING_VALUES" ]]; then
-        REMOVE_ARRAY=$(echo "$EXISTING_VALUES" | jq -R -s 'split("\n")[:-1]')
-        REMOVE_PAYLOAD=$(jq -n --argjson remove "$REMOVE_ARRAY" '{remove:$remove}')
-        PATCH_REMOVE_RESP=$(curl -sS -X PATCH "${CURL_AUTH[@]}" --data-raw "$REMOVE_PAYLOAD" "$API_BASE/gateway/lists/$LIST_ID")
-        echo "$PATCH_REMOVE_RESP" | jq -e '.success == true' >/dev/null || { echo "❌ Failed to remove old items"; exit 10; }
-      fi
-      
-      # 2. Thêm items mới
-      APPEND_PAYLOAD=$(jq -n --argjson items "$UPLOAD_ITEMS_PAYLOAD" '{append:$items}')
-      PATCH_APPEND_RESP=$(curl -sS -X PATCH "${CURL_AUTH[@]}" --data-raw "$APPEND_PAYLOAD" "$API_BASE/gateway/lists/$LIST_ID")
-      echo "$PATCH_APPEND_RESP" | jq -e '.success == true' >/dev/null || { echo "❌ Failed to append new items"; exit 10; }
-      echo " → Items replaced successfully."
+        # ==== DIFF-BASED UPDATE ====
+        GET_ITEMS_RESP=$(curl -sS -X GET "${CURL_AUTH[@]}" \
+            "$API_BASE/gateway/lists/$LIST_ID/items?per_page=1000")
+
+        mapfile -t OLD_ITEMS < <(echo "$GET_ITEMS_RESP" | jq -r '.result[].value')
+        mapfile -t NEW_ITEMS < <(cat "$CHUNK_FILE")
+
+        REMOVE_SET=$(comm -23 \
+            <(printf "%s\n" "${OLD_ITEMS[@]}" | sort -u) \
+            <(printf "%s\n" "${NEW_ITEMS[@]}" | sort -u)
+        )
+
+        ADD_SET=$(comm -13 \
+            <(printf "%s\n" "${OLD_ITEMS[@]}" | sort -u) \
+            <(printf "%s\n" "${NEW_ITEMS[@]}" | sort -u)
+        )
+
+        if [[ -n "$REMOVE_SET" ]]; then
+            REMOVE_PAYLOAD=$(printf "%s\n" "$REMOVE_SET" | jq -R -s 'split("\n")[:-1]' | jq '{remove: .}')
+            RESP_RM=$(curl -sS -X PATCH "${CURL_AUTH[@]}" \
+                --data-raw "$REMOVE_PAYLOAD" \
+                "$API_BASE/gateway/lists/$LIST_ID")
+            echo "   → Removed: $(printf "%s\n" $REMOVE_SET | wc -l)"
+        fi
+
+        if [[ -n "$ADD_SET" ]]; then
+            ADD_PAYLOAD=$(printf "%s\n" "$ADD_SET" | jq -R -s 'split("\n")[:-1] | map({value: .})' | jq '{append: .}')
+            RESP_ADD=$(curl -sS -X PATCH "${CURL_AUTH[@]}" \
+                --data-raw "$ADD_PAYLOAD" \
+                "$API_BASE/gateway/lists/$LIST_ID")
+            echo "   → Added: $(printf "%s\n" $ADD_SET | wc -l)"
+        fi
+
+        echo " → Diff update completed."
 
     else
-      # Create new
-      echo " → List not found. Creating new list..."
-      CREATE_PAYLOAD=$(jq -n \
-        --arg name "$CURRENT_LIST_NAME" \
-        --arg desc "$LIST_DESC (Part $LIST_NUM_FORMATTED)" \
-        --argjson items "$UPLOAD_ITEMS_PAYLOAD" \
-        '{name:$name, type:"DOMAIN", description:$desc, items:$items}'
-      )
-      CREATE_RESP=$(curl -sS -X POST "${CURL_AUTH[@]}" --data-raw "$CREATE_PAYLOAD" "$API_BASE/gateway/lists")
-      LIST_ID=$(echo "$CREATE_RESP" | jq -r '.result.id')
-      echo "$CREATE_RESP" | jq -e '.success == true' >/dev/null || { echo "❌ Failed to create list"; exit 5; }
-      echo " → Created new list ID: $LIST_ID"
+        # Create new list
+        echo " → Creating new list..."
+        UPLOAD_ITEMS_PAYLOAD=$(jq -R -s '
+            split("\n")[:-1] | map(select(length>0)) | map({value: .})
+        ' < "$CHUNK_FILE")
+
+        CREATE_PAYLOAD=$(jq -n \
+            --arg name "$CURRENT_LIST_NAME" \
+            --arg desc "$LIST_DESC (Part $LIST_NUM)" \
+            --argjson items "$UPLOAD_ITEMS_PAYLOAD" \
+            '{name:$name, type:"DOMAIN", description:$desc, items:$items}'
+        )
+        CREATE_RESP=$(curl -sS -X POST "${CURL_AUTH[@]}" --data-raw "$CREATE_PAYLOAD" "$API_BASE/gateway/lists")
+        LIST_ID=$(echo "$CREATE_RESP" | jq -r '.result.id')
+        echo " → Created: $LIST_ID"
     fi
 
     ALL_LIST_IDS+="$LIST_ID "
 done
 
-# --- 7. Cập nhật/Tạo Gateway DNS blocking rule ---
+# --- 7. Update rule ---
 echo "---"
-echo "4) Checking existing DNS blocking rule '$RULE_NAME'..."
+echo "4) Updating rule..."
 
-ENCODED_RULE_NAME=$(echo "$RULE_NAME" | sed 's/ /%20/g')
-GET_RULE_RESP=$(curl -sS -X GET "${CURL_AUTH[@]}" "$API_BASE/gateway/rules?name=$ENCODED_RULE_NAME")
-
-EXISTING_RULE_ID=$(echo "$GET_RULE_RESP" | jq -r '.result[]? | select(.name=="'"$RULE_NAME"'") | .id')
+ENCODED_RULE=$(echo "$RULE_NAME" | sed 's/ /%20/g')
+GET_RULE=$(curl -sS -X GET "${CURL_AUTH[@]}" "$API_BASE/gateway/rules?name=$ENCODED_RULE")
+EXISTING_RULE_ID=$(echo "$GET_RULE" | jq -r '.result[]? | select(.name=="'"$RULE_NAME"'") | .id')
 
 LIST_ID_ARRAY=($ALL_LIST_IDS)
-TRAFFIC_EXPRESSION=""
+TRAFFIC=""
 for id in "${LIST_ID_ARRAY[@]}"; do
-   TRAFFIC_EXPRESSION+="any(dns.domains[*] in \$$id) or "
+   TRAFFIC+="any(dns.domains[*] in \$$id) or "
 done
-TRAFFIC_EXPRESSION="${TRAFFIC_EXPRESSION% or }"
+TRAFFIC="${TRAFFIC% or }"
 
-# Lấy số thứ tự đầu tiên và cuối cùng để hiển thị trong mô tả (ví dụ: 001 đến 005)
-FIRST_LIST_NUM=$(printf "%03d" 1)
-LAST_LIST_NUM=$(printf "%03d" $NUM_CHUNKS)
+FIRST=$(printf "%03d" 1)
+LAST=$(printf "%03d" $NUM_CHUNKS)
 
-RULE_PAYLOAD=$(jq -n --arg name "$RULE_NAME" \
-  --arg desc "Block ads using $NUM_CHUNKS lists: $LIST_NAME $FIRST_LIST_NUM to $LAST_LIST_NUM" \
+RULE_PAYLOAD=$(jq -n \
+  --arg name "$RULE_NAME" \
+  --arg desc "Block ads using $NUM_CHUNKS lists: $LIST_NAME $FIRST to $LAST" \
   --argjson pri "$PRIORITY" \
-  --arg traffic "$TRAFFIC_EXPRESSION" \
-  '{
-     name:$name, description:$desc, enabled:true,
-     precedence:$pri, action:"block", filters:["dns"],
-     traffic:$traffic
-   }'
+  --arg traffic "$TRAFFIC" \
+  '{name:$name, description:$desc, enabled:true,
+    precedence:$pri, action:"block", filters:["dns"],
+    traffic:$traffic}'
 )
 
 if [[ -n "$EXISTING_RULE_ID" ]]; then
@@ -236,45 +221,40 @@ else
   RULE_ID=$(echo "$RESP_RULE" | jq -r '.result.id')
 fi
 
-echo "$RESP_RULE" | jq -e '.success == true' >/dev/null || { echo "❌ Failed to create/update rule"; exit 6; }
 echo " → Rule ID: $RULE_ID"
 
-# --- 8. Cleanup old lists ---
+# --- 8. Cleanup lists cũ không dùng ---
 echo "---"
 echo "5) Removing unused lists..."
 
-GET_ALL_LISTS_RESP=$(curl -sS -X GET "${CURL_AUTH[@]}" "$API_BASE/gateway/lists?per_page=100")
-CURRENT_LIST_IDS=$(echo "$ALL_LIST_IDS" | tr ' ' '\n' | sort -u)
+GET_ALL_LISTS=$(curl -sS -X GET "${CURL_AUTH[@]}" "$API_BASE/gateway/lists?per_page=200")
+CURRENT_IDS=$(echo "$ALL_LIST_IDS" | tr ' ' '\n' | sort -u)
 
-# Vẫn tìm theo tiền tố $LIST_NAME để xác định tất cả các phần của list này (cũ và mới)
-LISTS_TO_DELETE=$(echo "$GET_ALL_LISTS_RESP" | jq -r '
-  .result[]? | select(.name | startswith("'"$LIST_NAME"'"))
-  | "\(.id) \(.name)"
+LISTS_TO_DELETE=$(echo "$GET_ALL_LISTS" | jq -r '
+  .result[]? | select(.name | startswith("'"$LIST_NAME"'")) | "\(.id) \(.name)"
 ')
 
-DELETED_COUNT=0
+DELETED=0
+
 if [[ -n "$LISTS_TO_DELETE" ]]; then
   while IFS= read -r line; do
     ID=$(echo "$line" | awk '{print $1}')
     NAME=$(echo "$line" | cut -d' ' -f2-)
 
-    # Chỉ xóa nếu ID không nằm trong danh sách CURRENT_LIST_IDS (các list đã được cập nhật/sử dụng)
-    if ! echo "$CURRENT_LIST_IDS" | grep -q "^$ID$"; then
-      DELETE_RESP=$(curl -sS -X DELETE "${CURL_AUTH[@]}" "$API_BASE/gateway/lists/$ID")
-      echo "$DELETE_RESP" | jq -e '.success == true' >/dev/null && {
+    if ! echo "$CURRENT_IDS" | grep -q "^$ID$"; then
+      DEL=$(curl -sS -X DELETE "${CURL_AUTH[@]}" "$API_BASE/gateway/lists/$ID")
+      if echo "$DEL" | jq -e '.success == true' >/dev/null; then
         echo " → Deleted old list: $NAME ($ID)"
-        ((DELETED_COUNT++))
-      } || {
-        echo " → ⚠️ Failed to delete list: $NAME ($ID). API error: $(echo "$DELETE_RESP" | jq -r '.errors[].message')"
-      }
+        ((DELETED++))
+      fi
     fi
   done <<< "$LISTS_TO_DELETE"
 fi
 
 echo "=========================================="
 echo " ✅ DONE"
-echo "  Total domains processed: $NUM"
-echo "  Total lists created/updated: $NUM_CHUNKS (e.g., $LIST_NAME $FIRST_LIST_NUM to $LAST_LIST_NUM)"
-echo "  Total lists deleted: $DELETED_COUNT"
-echo "  RULE ID: $RULE_ID"
+echo "  Total domains: $NUM"
+echo "  Lists updated/created: $NUM_CHUNKS"
+echo "  Deleted old lists: $DELETED"
+echo "  Rule ID: $RULE_ID"
 echo "=========================================="
