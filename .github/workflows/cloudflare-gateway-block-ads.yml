@@ -1,0 +1,31 @@
+name: Cloudflare Gateway Adblock
+
+on:
+  push:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"    # chạy mỗi ngày 03:00 UTC
+
+jobs:
+  run-gateway-block:
+    permissions: write-all
+    name: Run Cloudflare Gateway Script
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Run Cloudflare Gateway AdBlock
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: bash cf-gateway-block-ads.sh
+
+      - name: Delete workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 1
