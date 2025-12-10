@@ -91,6 +91,7 @@ extract_domains < "$RAW_TEMPFILE" | \
   grep -vE '\.\.|^\.|\.$|_' | \
   grep -vE '^[0-9.]+$' | \
   sed -E 's/^www\.//' | \
+  grep -vE '^-|-$' | \
   awk 'length($0) <= 255' | \
   sort -u > "$CLEANFILE"
 
